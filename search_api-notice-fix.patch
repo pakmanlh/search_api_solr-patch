@@ -1,3 +1,20 @@
+diff --git a/composer.json b/composer.json
+index aec011a6..c93bab72 100644
+--- a/composer.json
++++ b/composer.json
+@@ -41,5 +41,12 @@
+         "drupal/facets": "Provides facetted search.",
+         "drupal/search_api_autocomplete": "Provides auto complete for search boxes.",
+         "drupal/search_api_location": "Provides location searches."
++    },
++    "extra": {
++        "patches": {
++            "solarium/solarium": {
++                "Notice implode function": "https://raw.githubusercontent.com/pakmanlh/search_api_solr-patch/master/solarium-notice.patch"
++            }
++        }
+     }
+ }
 diff --git a/src/Plugin/search_api/backend/SearchApiSolrBackend.php b/src/Plugin/search_api/backend/SearchApiSolrBackend.php
 index a85e16b4..91a4ae9e 100644
 --- a/src/Plugin/search_api/backend/SearchApiSolrBackend.php
