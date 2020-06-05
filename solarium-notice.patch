@@ -1,0 +1,13 @@
+diff --git a/src/Core/Query/AbstractRequestBuilder.php b/src/Core/Query/AbstractRequestBuilder.php
+index a7a91119..148deaf0 100644
+--- a/src/Core/Query/AbstractRequestBuilder.php
++++ b/src/Core/Query/AbstractRequestBuilder.php
+@@ -60,7 +60,7 @@ abstract class AbstractRequestBuilder implements RequestBuilderInterface
+             }
+ 
+             if (is_array($paramValue)) {
+-                $paramValue = implode($paramValue, ',');
++                $paramValue = implode(',', $paramValue);
+             }
+ 
+             $params .= $paramName.'='.$paramValue.' ';
