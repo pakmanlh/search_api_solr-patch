@@ -1,0 +1,2434 @@
+diff --git a/core/modules/media/config/schema/media.schema.yml b/core/modules/media/config/schema/media.schema.yml
+index a419dd866e..513c17b022 100644
+--- a/core/modules/media/config/schema/media.schema.yml
++++ b/core/modules/media/config/schema/media.schema.yml
+@@ -45,6 +45,14 @@ media.type.*:
+       sequence:
+         type: string
+ 
++field.storage_settings.media:
++  type: base_entity_reference_field_settings
++  label: 'Media settings'
++
++field.field_settings.media:
++  type: field.field_settings.entity_reference
++  label: 'Media settings'
++
+ field.formatter.settings.media_thumbnail:
+   type: field.formatter.settings.image
+   label: 'Media thumbnail field display format settings'
+diff --git a/core/modules/media/media.install b/core/modules/media/media.install
+index 83b6a35c21..23d62f1a75 100644
+--- a/core/modules/media/media.install
++++ b/core/modules/media/media.install
+@@ -9,6 +9,8 @@
+ use Drupal\Core\File\Exception\FileException;
+ use Drupal\Core\File\FileSystemInterface;
+ use Drupal\Core\Url;
++use Drupal\field\Entity\FieldConfig;
++use Drupal\field\Entity\FieldStorageConfig;
+ use Drupal\media\Entity\MediaType;
+ use Drupal\media\MediaTypeInterface;
+ use Drupal\media\Plugin\media\Source\OEmbedInterface;
+@@ -257,3 +259,64 @@ function media_update_8700() {
+   $definition_update_manager->updateEntityType($entity_type);
+   $definition_update_manager->updateFieldStorageDefinition($definition_update_manager->getFieldStorageDefinition('uid', 'media'));
+ }
++
++/**
++ * Change entity reference fields targeting media to use the 'media' field type."
++ */
++function media_update_8800() {
++  $configFactory = \Drupal::configFactory();
++
++  $changed_fields = [];
++  foreach ($configFactory->listAll('field.storage.') as $field_storage) {
++    $field_storage = $configFactory->getEditable($field_storage);
++
++    if ($field_storage->get('type') !== 'entity_reference' || $field_storage->get('settings.target_type') !== 'media') {
++      continue;
++    }
++    $field_name = $field_storage->get('field_name');
++    $entity_type = $field_storage->get('entity_type');
++
++    $changed_fields[] = sprintf('%s.%s', $entity_type, $field_name);
++
++    $spec = [
++      'description' => 'A map to overwrite media data per instance.',
++      'type' => 'blob',
++      'size' => 'big',
++      'serialize' => TRUE,
++    ];
++    \Drupal::database()->schema()->addField("${entity_type}__$field_name", "${field_name}_overwritten_property_map", $spec);
++    \Drupal::database()->schema()->addField("${entity_type}_revision__$field_name", "${field_name}_overwritten_property_map", $spec);
++
++    $lastInstalledSchemaRepository = \Drupal::service('entity.last_installed_schema.repository');
++    $storage_definition = $lastInstalledSchemaRepository->getLastInstalledFieldStorageDefinitions($entity_type);
++
++    $storage_definition[$field_name]->set('type', 'media');
++    $lastInstalledSchemaRepository->setLastInstalledFieldStorageDefinition($storage_definition[$field_name]);
++
++    \Drupal::service('entity_field.manager')->clearCachedFieldDefinitions();
++
++    $field_storage->set('type', 'media');
++    $field_storage->set('module', 'media');
++    $field_storage->save(TRUE);
++
++    FieldStorageConfig::loadByName($entity_type, $field_name)->calculateDependencies()->save();
++  }
++
++  foreach ($configFactory->listAll('field.field.') as $field_config) {
++    $field_config = $configFactory->getEditable($field_config);
++
++    $field_name = $field_config->get('field_name');
++    $entity_type = $field_config->get('entity_type');
++
++    $storage_name = sprintf('%s.%s', $entity_type, $field_name);
++    if (!in_array($storage_name, $changed_fields)) {
++      continue;
++    }
++
++    $field_config->set('field_type', 'media');
++    $field_config->save(TRUE);
++
++    FieldConfig::loadByName($entity_type, $field_config->get('bundle'), $field_name)->calculateDependencies()->save();
++  }
++
++}
+diff --git a/core/modules/media/media.module b/core/modules/media/media.module
+index 49df4f3f79..0bbaa57b46 100644
+--- a/core/modules/media/media.module
++++ b/core/modules/media/media.module
+@@ -166,25 +166,6 @@ function template_preprocess_media(array &$variables) {
+   }
+ }
+ 
+-/**
+- * Implements hook_field_ui_preconfigured_options_alter().
+- */
+-function media_field_ui_preconfigured_options_alter(array &$options, $field_type) {
+-  // If the field is not an "entity_reference"-based field, bail out.
+-  /** @var \Drupal\Core\Field\FieldTypePluginManager $field_type_manager */
+-  $field_type_manager = \Drupal::service('plugin.manager.field.field_type');
+-  $class = $field_type_manager->getPluginClass($field_type);
+-  if (!is_a($class, 'Drupal\Core\Field\Plugin\Field\FieldType\EntityReferenceItem', TRUE)) {
+-    return;
+-  }
+-
+-  // Set the default formatter for media in entity reference fields to be the
+-  // "Rendered entity" formatter.
+-  if (!empty($options['media'])) {
+-    $options['media']['entity_view_display']['type'] = 'entity_reference_entity_view';
+-  }
+-}
+-
+ /**
+  * Implements hook_form_FORM_ID_alter().
+  */
+@@ -203,7 +184,7 @@ function media_form_field_ui_field_storage_add_form_alter(&$form, FormStateInter
+   $field_types = [
+     'file',
+     'image',
+-    'field_ui:entity_reference:media',
++    'media',
+   ];
+   foreach ($field_types as $field_name) {
+     $form['add']['description_wrapper']["description_{$field_name}"] = [
+@@ -231,8 +212,7 @@ function media_field_widget_multivalue_form_alter(array &$elements, FormStateInt
+ 
+   // Only act on entity reference fields that reference media.
+   $field_type = $context['items']->getFieldDefinition()->getType();
+-  $target_type = $context['items']->getFieldDefinition()->getFieldStorageDefinition()->getSetting('target_type');
+-  if ($field_type !== 'entity_reference' ||  $target_type !== 'media') {
++  if ($field_type !== 'media') {
+     return;
+   }
+ 
+@@ -526,3 +506,22 @@ function media_views_query_substitutions(ViewExecutable $view) {
+     '***ADMINISTER_MEDIA***' => (int) $account->hasPermission('administer media'),
+   ];
+ }
++
++/**
++ * Implements hook_field_formatter_info_alter().
++ */
++function media_field_formatter_info_alter(&$info) {
++  // Allow entity reference formatters to be used on media fields.
++  $info['entity_reference_entity_id']['field_types'][] = 'media';
++  $info['entity_reference_entity_view']['field_types'][] = 'media';
++  $info['entity_reference_label']['field_types'][] = 'media';
++}
++
++/**
++ * Implements hook_field_widget_info_alter().
++ */
++function media_field_widget_info_alter(&$info) {
++  // Allow entity reference widgets to be used on media fields.
++  $info['entity_reference_autocomplete_tags']['field_types'][] = 'media';
++  $info['entity_reference_autocomplete']['field_types'][] = 'media';
++}
+diff --git a/core/modules/media/src/Entity/Media.php b/core/modules/media/src/Entity/Media.php
+index 55572560b4..3c6babcab4 100644
+--- a/core/modules/media/src/Entity/Media.php
++++ b/core/modules/media/src/Entity/Media.php
+@@ -70,7 +70,6 @@
+  *   permission_granularity = "bundle",
+  *   admin_permission = "administer media",
+  *   field_ui_base_route = "entity.media_type.edit_form",
+- *   common_reference_target = TRUE,
+  *   links = {
+  *     "add-page" = "/media/add",
+  *     "add-form" = "/media/add/{media_type}",
+diff --git a/core/modules/media/src/Entity/MediaType.php b/core/modules/media/src/Entity/MediaType.php
+index 3a5add6e5c..ee04e28ad0 100644
+--- a/core/modules/media/src/Entity/MediaType.php
++++ b/core/modules/media/src/Entity/MediaType.php
+@@ -235,4 +235,11 @@ public function setFieldMap(array $map) {
+     return $this->set('field_map', $map);
+   }
+ 
++  /**
++   * {@inheritdoc}
++   */
++  public function getOverridableProperties() {
++    return array_merge($this->getSource()->getOverridableProperties(), ['name' => []]);
++  }
++
+ }
+diff --git a/core/modules/media/src/MediaSourceBase.php b/core/modules/media/src/MediaSourceBase.php
+index 5cc284835e..7f9916317b 100644
+--- a/core/modules/media/src/MediaSourceBase.php
++++ b/core/modules/media/src/MediaSourceBase.php
+@@ -360,4 +360,11 @@ public function prepareFormDisplay(MediaTypeInterface $type, EntityFormDisplayIn
+     ]);
+   }
+ 
++  /**
++   * {@inheritdoc}
++   */
++  public function getOverridableProperties() {
++    return [];
++  }
++
+ }
+diff --git a/core/modules/media/src/MediaSourceInterface.php b/core/modules/media/src/MediaSourceInterface.php
+index 3154eb064d..e699cd441b 100644
+--- a/core/modules/media/src/MediaSourceInterface.php
++++ b/core/modules/media/src/MediaSourceInterface.php
+@@ -193,4 +193,12 @@ public function prepareFormDisplay(MediaTypeInterface $type, EntityFormDisplayIn
+    */
+   public function getSourceFieldValue(MediaInterface $media);
+ 
++  /**
++   * Returns an array of allowed property overrides.
++   *
++   * @return array
++   *   Array with field name as key and properties as values.
++   */
++  public function getOverridableProperties();
++
+ }
+diff --git a/core/modules/media/src/MediaTypeInterface.php b/core/modules/media/src/MediaTypeInterface.php
+index 7e3b9fde84..3183982d2e 100644
+--- a/core/modules/media/src/MediaTypeInterface.php
++++ b/core/modules/media/src/MediaTypeInterface.php
+@@ -98,4 +98,12 @@ public function getFieldMap();
+    */
+   public function setFieldMap(array $map);
+ 
++  /**
++   * Returns an array of allowed property overrides.
++   *
++   * @return array
++   *   Array with field name as key and properties as values.
++   */
++  public function getOverridableProperties();
++
+ }
+diff --git a/core/modules/media/src/Plugin/Field/FieldFormatter/MediaThumbnailFormatter.php b/core/modules/media/src/Plugin/Field/FieldFormatter/MediaThumbnailFormatter.php
+index dbceaf8a11..27dee5a0f0 100644
+--- a/core/modules/media/src/Plugin/Field/FieldFormatter/MediaThumbnailFormatter.php
++++ b/core/modules/media/src/Plugin/Field/FieldFormatter/MediaThumbnailFormatter.php
+@@ -21,7 +21,7 @@
+  *   id = "media_thumbnail",
+  *   label = @Translation("Thumbnail"),
+  *   field_types = {
+- *     "entity_reference"
++ *     "media"
+  *   }
+  * )
+  */
+@@ -162,15 +162,6 @@ public function viewElements(FieldItemListInterface $items, $langcode) {
+     return $elements;
+   }
+ 
+-  /**
+-   * {@inheritdoc}
+-   */
+-  public static function isApplicable(FieldDefinitionInterface $field_definition) {
+-    // This formatter is only available for entity types that reference
+-    // media items.
+-    return ($field_definition->getFieldStorageDefinition()->getSetting('target_type') == 'media');
+-  }
+-
+   /**
+    * Get the URL for the media thumbnail.
+    *
+diff --git a/core/modules/media/src/Plugin/Field/FieldType/MediaItem.php b/core/modules/media/src/Plugin/Field/FieldType/MediaItem.php
+new file mode 100644
+index 0000000000..25c317361f
+--- /dev/null
++++ b/core/modules/media/src/Plugin/Field/FieldType/MediaItem.php
+@@ -0,0 +1,94 @@
++<?php
++
++namespace Drupal\media\Plugin\Field\FieldType;
++
++use Drupal\Core\Field\FieldStorageDefinitionInterface;
++use Drupal\Core\Field\Plugin\Field\FieldType\EntityReferenceItem;
++use Drupal\Core\TypedData\MapDataDefinition;
++use Drupal\media\Entity\Media;
++use Drupal\media\ReadOnlyMedia;
++
++/**
++ * Plugin implementation of the 'media' field type.
++ *
++ * @FieldType(
++ *   id = "media",
++ *   label = @Translation("Media"),
++ *   description = @Translation("This field stores the reference to a media item and additional overwritten data."),
++ *   category = @Translation("Reference"),
++ *   default_widget = "entity_reference_autocomplete",
++ *   default_formatter = "entity_reference_entity_view",
++ *   list_class = "\Drupal\Core\Field\EntityReferenceFieldItemList",
++ *   constraints = {"OverwrittenMetadata" = {}}
++ * )
++ */
++class MediaItem extends EntityReferenceItem {
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function defaultStorageSettings() {
++    return [
++      'target_type' => 'media',
++    ] + parent::defaultStorageSettings();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function propertyDefinitions(FieldStorageDefinitionInterface $field_definition) {
++    $properties = parent::propertyDefinitions($field_definition);
++
++    $properties['overwritten_property_map'] = MapDataDefinition::create()
++      ->setLabel(t('Overwritten property map'));
++
++    return $properties;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function schema(FieldStorageDefinitionInterface $field_definition) {
++
++    $schema = parent::schema($field_definition);
++
++    $schema['columns']['overwritten_property_map'] = [
++      'description' => 'A map to overwrite media data per instance.',
++      'type' => 'blob',
++      'size' => 'big',
++      'serialize' => TRUE,
++    ];
++    return $schema;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function __get($name) {
++    if ($name == 'entity') {
++      $media = parent::__get('entity');
++      if ($media instanceof Media) {
++        return new ReadOnlyMedia($media, $this->values['overwritten_property_map'] ?? []);
++      }
++    }
++    return parent::__get($name);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function preSave() {
++    parent::preSave();
++    if (empty($this->values['overwritten_property_map'])) {
++      $this->values['overwritten_property_map'] = [];
++    }
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function getPreconfiguredOptions() {
++    return [];
++  }
++
++}
+diff --git a/core/modules/media/src/Plugin/Validation/Constraint/OverwrittenMetadataConstraint.php b/core/modules/media/src/Plugin/Validation/Constraint/OverwrittenMetadataConstraint.php
+new file mode 100644
+index 0000000000..c30d9bcdf5
+--- /dev/null
++++ b/core/modules/media/src/Plugin/Validation/Constraint/OverwrittenMetadataConstraint.php
+@@ -0,0 +1,21 @@
++<?php
++
++namespace Drupal\media\Plugin\Validation\Constraint;
++
++use Symfony\Component\Validator\Constraint;
++
++/**
++ * Overwritten Metadata Validation.
++ *
++ * @Constraint(
++ *   id = "OverwrittenMetadata",
++ *   label = @Translation("Overwritten Metadata Validation", context = "Validation")
++ * )
++ */
++class OverwrittenMetadataConstraint extends Constraint {
++
++  public $notAllowedFieldToOverwrite = 'Field %field_name is not allowed to be overwritten.';
++
++  public $notAllowedFieldPropertyToOverwrite = 'The property %property on field %field_name is not allowed to be overwritten.';
++
++}
+diff --git a/core/modules/media/src/Plugin/Validation/Constraint/OverwrittenMetadataConstraintValidator.php b/core/modules/media/src/Plugin/Validation/Constraint/OverwrittenMetadataConstraintValidator.php
+new file mode 100644
+index 0000000000..9339f7b9e0
+--- /dev/null
++++ b/core/modules/media/src/Plugin/Validation/Constraint/OverwrittenMetadataConstraintValidator.php
+@@ -0,0 +1,86 @@
++<?php
++
++namespace Drupal\media\Plugin\Validation\Constraint;
++
++use Drupal\Core\DependencyInjection\ContainerInjectionInterface;
++use Drupal\Core\TypedData\TypedDataManagerInterface;
++use Symfony\Component\DependencyInjection\ContainerInterface;
++use Symfony\Component\Validator\Constraint;
++use Symfony\Component\Validator\ConstraintValidator;
++
++/**
++ * Validates the overwritten_property_map.
++ */
++class OverwrittenMetadataConstraintValidator extends ConstraintValidator implements ContainerInjectionInterface {
++
++  /**
++   * The typed data manager service.
++   *
++   * @var \Drupal\Core\TypedData\TypedDataManagerInterface
++   */
++  protected $typedDataManager;
++
++  /**
++   * Constructs a new OverwrittenMetadataConstraintValidator.
++   *
++   * @param \Drupal\Core\TypedData\TypedDataManagerInterface $typedDataManager
++   *   The typed data manager service.
++   */
++  public function __construct(TypedDataManagerInterface $typedDataManager) {
++    $this->typedDataManager = $typedDataManager;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function create(ContainerInterface $container) {
++    return new static(
++      $container->get('typed_data_manager')
++    );
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function validate($value, Constraint $constraint) {
++    /** @var \Drupal\media\Plugin\Field\FieldType\MediaItem $value */
++    $target = $value->get('entity')->getTarget();
++
++    /** @var \Drupal\media\Entity\Media $media */
++    $media = $target->getValue();
++
++    $overridable_properties = $media->bundle->entity->getOverridableProperties();
++    $overrides = $value->overwritten_property_map;
++    if (empty($overrides)) {
++      return;
++    }
++    foreach ($overrides as $field => $properties) {
++      if (!array_key_exists($field, $overridable_properties)) {
++        $this->context->addViolation($constraint->notAllowedFieldToOverwrite, ['%field_name' => $field]);
++        continue;
++      }
++      $data_type = $media->get($field)->get(0)->getDataDefinition();
++      $typedData = $this->typedDataManager->create($data_type);
++      if (is_array($properties)) {
++        foreach ($properties as $property => $property_value) {
++          if (!in_array($property, $overridable_properties[$field])) {
++            $this->context->addViolation($constraint->notAllowedFieldPropertyToOverwrite, ['%field_name' => $field, '%property' => $property]);
++            continue;
++          }
++          $typedData->{$property} = $property_value;
++        }
++      }
++      else {
++        $typedData->setValue($properties);
++      }
++      $violations = $typedData->validate();
++      if ($violations->count()) {
++        /** @var \Symfony\Component\Validator\ConstraintViolationInterface $violation */
++        foreach ($violations as $violation) {
++          $this->context->addViolation($violation->getMessage());
++        }
++      }
++    }
++  }
++
++}
+diff --git a/core/modules/media/src/Plugin/media/Source/File.php b/core/modules/media/src/Plugin/media/Source/File.php
+index 1c963ef963..3b4e7c0489 100644
+--- a/core/modules/media/src/Plugin/media/Source/File.php
++++ b/core/modules/media/src/Plugin/media/Source/File.php
+@@ -124,4 +124,11 @@ public function createSourceField(MediaTypeInterface $type) {
+     return parent::createSourceField($type)->set('settings', ['file_extensions' => 'txt doc docx pdf']);
+   }
+ 
++  /**
++   * {@inheritdoc}
++   */
++  public function getOverridableProperties() {
++    return [$this->configuration['source_field'] => ['description']];
++  }
++
+ }
+diff --git a/core/modules/media/src/Plugin/media/Source/Image.php b/core/modules/media/src/Plugin/media/Source/Image.php
+index be37177f2d..8997d02e3c 100644
+--- a/core/modules/media/src/Plugin/media/Source/Image.php
++++ b/core/modules/media/src/Plugin/media/Source/Image.php
+@@ -182,4 +182,11 @@ public function prepareViewDisplay(MediaTypeInterface $type, EntityViewDisplayIn
+     $display->setComponent($field_name, $component);
+   }
+ 
++  /**
++   * {@inheritdoc}
++   */
++  public function getOverridableProperties() {
++    return [$this->configuration['source_field'] => ['alt', 'title']];
++  }
++
+ }
+diff --git a/core/modules/media/src/ReadOnlyMedia.php b/core/modules/media/src/ReadOnlyMedia.php
+new file mode 100644
+index 0000000000..3313feba6b
+--- /dev/null
++++ b/core/modules/media/src/ReadOnlyMedia.php
+@@ -0,0 +1,857 @@
++<?php
++
++namespace Drupal\media;
++
++use Drupal\Component\Utility\NestedArray;
++use Drupal\Core\Entity\EntityStorageInterface;
++use Drupal\Core\Entity\EntityTypeInterface;
++use Drupal\Core\Session\AccountInterface;
++use Drupal\media\Entity\Media;
++use Drupal\user\UserInterface;
++
++/**
++ * This is a read only media entity. It's returned by the media type field.
++ *
++ * @internal
++ */
++class ReadOnlyMedia implements ReadOnlyMediaInterface {
++
++  /**
++   * The overwritten properties.
++   *
++   * @var array
++   */
++  protected $overwrittenPropertyMap;
++
++  /**
++   * The decorated media entity.
++   *
++   * @var \Drupal\media\Entity\Media
++   */
++  protected $media;
++
++  /**
++   * ReadOnlyMedia constructor.
++   *
++   * @param \Drupal\media\Entity\Media $media
++   *   The decorated media entity.
++   * @param array $overwritten_property_map
++   *   The overwritten properties.
++   */
++  public function __construct(Media $media, array $overwritten_property_map) {
++    $this->media = $media;
++    $this->overwrittenPropertyMap = $overwritten_property_map;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function save() {
++    throw new \RuntimeException("It's not allowed to save a media item fetched from a reference field");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function label() {
++    return $this->getName();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getName() {
++    return $this->get('name')->value;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function &__get($name) {
++    $var = $this->get($name);
++    return $var;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function get($name) {
++    if (!empty($this->overwrittenPropertyMap[$name])) {
++      /** @var \Drupal\Core\Field\FieldTypePluginManager $field_type_manager */
++      $field_type_manager = \Drupal::service('plugin.manager.field.field_type');
++      if (is_array($this->overwrittenPropertyMap[$name])) {
++        // Remove keys that don't exists in original media entity.
++        $values = array_intersect_key($this->overwrittenPropertyMap[$name], $this->media->get($name)->getValue());
++        $values = NestedArray::mergeDeepArray([$this->media->get($name)->getValue(), $values], TRUE);
++      }
++      else {
++        $values = $this->overwrittenPropertyMap[$name];
++      }
++      return $field_type_manager->createFieldItemList($this->media, $name, $values);
++    }
++    return $this->media->get($name);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function set($field_name, $value, $notify = TRUE) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function access($operation, AccountInterface $account = NULL, $return_as_object = FALSE) {
++    return $this->media->access($operation, $account, $return_as_object);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getCacheContexts() {
++    return $this->media->getCacheContexts();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getCacheTags() {
++    return $this->media->getCacheTags();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getCacheMaxAge() {
++    return $this->media->getCacheMaxAge();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getChangedTime() {
++    return $this->media->getChangedTime();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setChangedTime($timestamp) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getChangedTimeAcrossTranslations() {
++    return $this->media->getChangedTimeAcrossTranslations();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function uuid() {
++    return $this->media->uuid();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function id() {
++    return $this->media->id();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function language() {
++    return $this->media->language();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isNew() {
++    return $this->media->isNew();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function enforceIsNew($value = TRUE) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getEntityTypeId() {
++    return $this->media->getEntityTypeId();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function bundle() {
++    return $this->media->bundle();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function urlInfo($rel = 'canonical', array $options = []) {
++    return $this->media->urlInfo($rel, $options);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function toUrl($rel = 'canonical', array $options = []) {
++    return $this->media->toUrl($rel, $options);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function url($rel = 'canonical', $options = []) {
++    return $this->media->url($rel, $options);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function link($text = NULL, $rel = 'canonical', array $options = []) {
++    return $this->media->link($text, $rel, $options);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function toLink($text = NULL, $rel = 'canonical', array $options = []) {
++    return $this->media->toLink($text, $rel, $options);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function hasLinkTemplate($key) {
++    return $this->media->hasLinkTemplate($key);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function uriRelationships() {
++    return $this->media->uriRelationships();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function load($id) {
++    throw new \RuntimeException("Static loading of a read-only entity is not allowed.");
++
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function loadMultiple(array $ids = NULL) {
++    throw new \RuntimeException("Static loading of a read-only entity is not allowed.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function create(array $values = []) {
++    throw new \RuntimeException("Manually creating of a read-only entity is not allowed.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function delete() {
++    throw new \RuntimeException("It's not allowed to save a media item fetched from a reference field");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function preSave(EntityStorageInterface $storage) {
++    throw new \RuntimeException("It's not allowed to save a media item fetched from a reference field");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function postSave(EntityStorageInterface $storage, $update = TRUE) {
++    throw new \RuntimeException("It's not allowed to save a media item fetched from a reference field");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function preCreate(EntityStorageInterface $storage, array &$values) {
++    throw new \RuntimeException("It's not allowed to create a read-only media item manually");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function postCreate(EntityStorageInterface $storage) {
++    throw new \RuntimeException("It's not allowed to create a read-only media item manually");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function preDelete(EntityStorageInterface $storage, array $entities) {
++    throw new \RuntimeException("It's not allowed to delete a media item fetched from a reference field");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function postDelete(EntityStorageInterface $storage, array $entities) {
++    throw new \RuntimeException("It's not allowed to delete a media item fetched from a reference field");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function postLoad(EntityStorageInterface $storage, array &$entities) {
++    throw new \RuntimeException("Static loading of a read-only entity is not allowed.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function createDuplicate() {
++    throw new \RuntimeException("Duplicating a read-only entity is not allowed.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getEntityType() {
++    return $this->media->getEntityType();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function referencedEntities() {
++    return $this->media->referencedEntities();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getOriginalId() {
++    return $this->media->getOriginalId();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getCacheTagsToInvalidate() {
++    return $this->media->getCacheTagsToInvalidate();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setOriginalId($id) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getTypedData() {
++    $typed_data = $this->media->getTypedData();
++    foreach (array_keys($this->overwrittenPropertyMap) as $fields) {
++      $typed_data->get($fields)->setValue($this->get($fields)->getValue());
++    }
++
++    return $typed_data;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getConfigDependencyKey() {
++    return $this->media->getConfigDependencyKey();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getConfigDependencyName() {
++    return $this->media->getConfigDependencyName();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getConfigTarget() {
++    return $this->media->getConfigTarget();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getOwner() {
++    return $this->media->getOwner();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setOwner(UserInterface $account) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getOwnerId() {
++    return $this->media->getOwnerId();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setOwnerId($uid) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isPublished() {
++    return $this->media->isPublished();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setPublished($published = NULL) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setUnpublished() {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function baseFieldDefinitions(EntityTypeInterface $entity_type) {
++    return Media::baseFieldDefinitions($entity_type);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public static function bundleFieldDefinitions(EntityTypeInterface $entity_type, $bundle, array $base_field_definitions) {
++    return Media::bundleFieldDefinitions($entity_type, $bundle, $base_field_definitions);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function hasField($field_name) {
++    return $this->media->hasField($field_name);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getFieldDefinition($name) {
++    return $this->media->getFieldDefinition($name);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getFieldDefinitions() {
++    return $this->media->getFieldDefinitions();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function toArray() {
++    $values = [];
++    foreach ($this->getFields() as $name => $property) {
++      if (array_key_exists($name, $this->overwrittenPropertyMap)) {
++        $property = $this->get($name);
++      }
++      $values[$name] = $property->getValue();
++    }
++    return $values;
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getFields($include_computed = TRUE) {
++    return $this->media->getFields($include_computed);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getTranslatableFields($include_computed = TRUE) {
++    return $this->media->getTranslatableFields($include_computed);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function onChange($field_name) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function validate() {
++    return $this->media->validate();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isValidationRequired() {
++    return $this->media->isValidationRequired();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setValidationRequired($required) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setName($name) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getCreatedTime() {
++    return $this->media->getCreatedTime();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setCreatedTime($timestamp) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getSource() {
++    return $this->media->getSource();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function addCacheContexts(array $cache_contexts) {
++    return $this->media->addCacheContexts($cache_contexts);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function addCacheTags(array $cache_tags) {
++    return $this->media->addCacheTags($cache_tags);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function mergeCacheMaxAge($max_age) {
++    return $this->media->mergeCacheMaxAge($max_age);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function addCacheableDependency($other_object) {
++    return $this->media->addCacheableDependency($other_object);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getRevisionCreationTime() {
++    return $this->media->getRevisionCreationTime();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setRevisionCreationTime($timestamp) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getRevisionUser() {
++    return $this->media->getRevisionUser();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setRevisionUser(UserInterface $account) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getRevisionUserId() {
++    return $this->media->getRevisionUserId();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setRevisionUserId($user_id) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getRevisionLogMessage() {
++    return $this->media->getRevisionLogMessage();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setRevisionLogMessage($revision_log_message) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isNewRevision() {
++    return $this->media->isNewRevision();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setNewRevision($value = TRUE) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getRevisionId() {
++    return $this->media->getRevisionId();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getLoadedRevisionId() {
++    return $this->media->getLoadedRevisionId();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function updateLoadedRevisionId() {
++    throw new \RuntimeException("It's not allowed to update the loaded revision id for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isDefaultRevision($new_value = NULL) {
++    return $this->media->isDefaultRevision($new_value);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function wasDefaultRevision() {
++    return $this->media->wasDefaultRevision();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isLatestRevision() {
++    return $this->media->isLatestRevision();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function preSaveRevision(EntityStorageInterface $storage, \stdClass $record) {
++    throw new \RuntimeException("It's not allowed to save a media item fetched from a reference field");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setSyncing($status) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isSyncing() {
++    return $this->media->isSyncing();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function hasTranslationChanges() {
++    return $this->media->hasTranslationChanges();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isDefaultTranslation() {
++    return $this->media->isDefaultTranslation();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isNewTranslation() {
++    return $this->media->isNewTranslation();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getTranslationLanguages($include_default = TRUE) {
++    return $this->media->getTranslationLanguages($include_default);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getTranslation($langcode) {
++    return new ReadOnlyMedia($this->media->getTranslation($langcode), $this->overwrittenPropertyMap);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getUntranslated() {
++    return $this->media->getUntranslated();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function hasTranslation($langcode) {
++    return $this->media->hasTranslation($langcode);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function addTranslation($langcode, array $values = []) {
++    return $this->media->addTranslation($langcode, $values);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function removeTranslation($langcode) {
++    return $this->media->removeTranslation($langcode);
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isTranslatable() {
++    return $this->media->isTranslatable();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isLatestTranslationAffectedRevision() {
++    return $this->media->isLatestTranslationAffectedRevision();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setRevisionTranslationAffected($affected) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isRevisionTranslationAffected() {
++    return $this->media->isRevisionTranslationAffected();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isRevisionTranslationAffectedEnforced() {
++    return $this->media->isRevisionTranslationAffectedEnforced();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function setRevisionTranslationAffectedEnforced($enforced) {
++    throw new \RuntimeException("It's not allowed to change values for a read-only media entity.");
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function isDefaultTranslationAffectedOnly() {
++    return $this->media->isDefaultTranslationAffectedOnly();
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getIterator() {
++    return new \ArrayIterator($this->getFields());
++  }
++
++  /**
++   * {@inheritdoc}
++   */
++  public function getTranslationStatus($langcode) {
++    return $this->media->getTranslationStatus($langcode);
++  }
++
++}
+diff --git a/core/modules/media/src/ReadOnlyMediaInterface.php b/core/modules/media/src/ReadOnlyMediaInterface.php
+new file mode 100644
+index 0000000000..debc1a5ac7
+--- /dev/null
++++ b/core/modules/media/src/ReadOnlyMediaInterface.php
+@@ -0,0 +1,13 @@
++<?php
++
++namespace Drupal\media;
++
++use Drupal\Core\TypedData\TranslationStatusInterface;
++use IteratorAggregate;
++
++/**
++ * Provides an interface defining a read-only media entity.
++ */
++interface ReadOnlyMediaInterface extends MediaInterface, IteratorAggregate, TranslationStatusInterface {
++
++}
+diff --git a/core/modules/media/tests/src/Functional/MediaAccessTest.php b/core/modules/media/tests/src/Functional/MediaAccessTest.php
+index c50f573300..4b73a987f5 100644
+--- a/core/modules/media/tests/src/Functional/MediaAccessTest.php
++++ b/core/modules/media/tests/src/Functional/MediaAccessTest.php
+@@ -334,7 +334,7 @@ public function testReferencedRendering() {
+     FieldStorageConfig::create([
+       'field_name' => 'field_reference',
+       'entity_type' => 'media',
+-      'type' => 'entity_reference',
++      'type' => 'media',
+       'settings' => [
+         'target_type' => 'media',
+       ],
+diff --git a/core/modules/media/tests/src/Functional/MediaUiFunctionalTest.php b/core/modules/media/tests/src/Functional/MediaUiFunctionalTest.php
+index 42220d2e13..94c9d9e97e 100644
+--- a/core/modules/media/tests/src/Functional/MediaUiFunctionalTest.php
++++ b/core/modules/media/tests/src/Functional/MediaUiFunctionalTest.php
+@@ -178,7 +178,7 @@ public function testRenderedEntityReferencedMedia() {
+ 
+     $this->drupalCreateContentType(['type' => 'page', 'name' => 'Page']);
+     $this->drupalGet('/admin/structure/types/manage/page/fields/add-field');
+-    $page->selectFieldOption('new_storage_type', 'field_ui:entity_reference:media');
++    $page->selectFieldOption('new_storage_type', 'media');
+     $page->fillField('label', 'Foo field');
+     $page->fillField('field_name', 'foo_field');
+     $page->pressButton('Save and continue');
+@@ -324,7 +324,7 @@ public function testMediaReferenceWidget($cardinality, array $media_type_create_
+     // Using drupalPostForm() to avoid dealing with JavaScript on the previous
+     // page in the field creation.
+     $edit = [
+-      'new_storage_type' => 'field_ui:entity_reference:media',
++      'new_storage_type' => 'media',
+       'label' => "Media (cardinality $cardinality)",
+       'field_name' => 'media_reference',
+     ];
+diff --git a/core/modules/media/tests/src/Functional/Update/MediaUpdateTest.php b/core/modules/media/tests/src/Functional/Update/MediaUpdateTest.php
+index 7e6c925bbd..6722d7f37f 100644
+--- a/core/modules/media/tests/src/Functional/Update/MediaUpdateTest.php
++++ b/core/modules/media/tests/src/Functional/Update/MediaUpdateTest.php
+@@ -2,6 +2,9 @@
+ 
+ namespace Drupal\Tests\media\Functional\Update;
+ 
++use Drupal\Core\Field\FieldStorageDefinitionInterface;
++use Drupal\field\Entity\FieldConfig;
++use Drupal\field\Entity\FieldStorageConfig;
+ use Drupal\FunctionalTests\Update\UpdatePathTestBase;
+ use Drupal\media\Entity\Media;
+ use Drupal\Tests\media\Traits\MediaTypeCreationTrait;
+@@ -135,4 +138,53 @@ public function testMediaViewStatusExtraFilter() {
+     $this->assertFalse($filter['exposed']);
+   }
+ 
++  /**
++   * Tests the update path to the standalone media field type.
++   */
++  public function testMediaFieldTypeSwich() {
++    // Create a non-media entity reference.
++    $media_storage = FieldStorageConfig::create([
++      'field_name' => 'field_media',
++      'entity_type' => 'node',
++      'type' => 'entity_reference',
++      'cardinality' => FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED,
++      'settings' => [
++        'target_type' => 'media',
++      ],
++    ]);
++    $media_storage->save();
++    $media_field = FieldConfig::create([
++      'label' => 'No yet media here!',
++      'field_storage' => $media_storage,
++      'entity_type' => 'node',
++      'bundle' => 'article',
++      'settings' => [
++        'handler' => 'default',
++        'handler_settings' => [
++          'target_bundles' => [
++            'image' => 'image',
++          ],
++        ],
++      ],
++    ]);
++    $media_field->save();
++
++    $schema = \Drupal::database()->schema();
++
++    $this->assertFalse($schema->fieldExists('node__field_media', 'field_media_overwritten_property_map'));
++    $this->assertFalse($schema->fieldExists('node_revision__field_media', 'field_media_overwritten_property_map'));
++
++    $this->runUpdates();
++
++    $media_storage = FieldStorageConfig::load('node.field_media');
++    $this->assertEquals('media', $media_storage->getType());
++    $this->assertEquals('media', $media_storage->getTypeProvider());
++
++    $media_field = FieldConfig::load('node.article.field_media');
++    $this->assertEquals('media', $media_field->getType());
++
++    $this->assertTrue($schema->fieldExists('node__field_media', 'field_media_overwritten_property_map'));
++    $this->assertTrue($schema->fieldExists('node_revision__field_media', 'field_media_overwritten_property_map'));
++  }
++
+ }
+diff --git a/core/modules/media/tests/src/FunctionalJavascript/MediaDisplayTest.php b/core/modules/media/tests/src/FunctionalJavascript/MediaDisplayTest.php
+index 51ac71f6bc..0ae19e5786 100644
+--- a/core/modules/media/tests/src/FunctionalJavascript/MediaDisplayTest.php
++++ b/core/modules/media/tests/src/FunctionalJavascript/MediaDisplayTest.php
+@@ -149,7 +149,7 @@ public function testMediaDisplay() {
+     $storage = FieldStorageConfig::create([
+       'entity_type' => 'node',
+       'field_name' => 'field_related_media',
+-      'type' => 'entity_reference',
++      'type' => 'media',
+       'settings' => [
+         'target_type' => 'media',
+       ],
+diff --git a/core/modules/media/tests/src/FunctionalJavascript/MediaReferenceFieldHelpTest.php b/core/modules/media/tests/src/FunctionalJavascript/MediaReferenceFieldHelpTest.php
+index c817c790b0..0c64d97784 100644
+--- a/core/modules/media/tests/src/FunctionalJavascript/MediaReferenceFieldHelpTest.php
++++ b/core/modules/media/tests/src/FunctionalJavascript/MediaReferenceFieldHelpTest.php
+@@ -33,7 +33,7 @@ public function testFieldCreationHelpText() {
+     $field_types = [
+       'file',
+       'image',
+-      'field_ui:entity_reference:media',
++      'media',
+     ];
+     $description_ids = array_map(function ($item) {
+       return '#edit-description-' . Html::cleanCssIdentifier($item);
+diff --git a/core/modules/media/tests/src/FunctionalJavascript/MediaStandardProfileTest.php b/core/modules/media/tests/src/FunctionalJavascript/MediaStandardProfileTest.php
+index c353ace4fb..2a7a1e0b88 100644
+--- a/core/modules/media/tests/src/FunctionalJavascript/MediaStandardProfileTest.php
++++ b/core/modules/media/tests/src/FunctionalJavascript/MediaStandardProfileTest.php
+@@ -52,7 +52,7 @@ public function testMediaSources() {
+     $storage = FieldStorageConfig::create([
+       'entity_type' => 'node',
+       'field_name' => 'field_related_media',
+-      'type' => 'entity_reference',
++      'type' => 'media',
+       'settings' => [
+         'target_type' => 'media',
+       ],
+@@ -128,8 +128,8 @@ protected function audioTest() {
+       ->execute();
+     $audio_media_id = reset($audio_media_id);
+ 
+-    // Reference the created media using an entity_reference field and make sure
+-    // the output is what we expect.
++    // Reference the created media using a media field and make sure the output
++    // is what we expect.
+     $node = Node::create([
+       'title' => 'Host node',
+       'type' => 'article',
+@@ -213,8 +213,8 @@ protected function imageTest() {
+       ->execute();
+     $image_media_id = reset($image_media_id);
+ 
+-    // Reference the created media using an entity_reference field and make sure
+-    // the output is what we expect.
++    // Reference the created media using a media field and make sure the output
++    // is what we expect.
+     $node = Node::create([
+       'title' => 'Host node',
+       'type' => 'article',
+@@ -312,8 +312,8 @@ protected function documentTest() {
+       ->execute();
+     $file_media_id = reset($file_media_id);
+ 
+-    // Reference the created media using an entity_reference field and make sure
+-    // the output is what we expect.
++    // Reference the created media using a media field and make sure the output
++    // is what we expect.
+     $node = Node::create([
+       'title' => 'Host node',
+       'type' => 'article',
+@@ -399,8 +399,8 @@ protected function remoteVideoTest() {
+       ->execute();
+     $remote_video_media_id = reset($remote_video_media_id);
+ 
+-    // Reference the created media using an entity_reference field and make sure
+-    // the output is what we expect.
++    // Reference the created media using a media field and make sure the output
++    // is what we expect.
+     $node = Node::create([
+       'title' => 'Host node',
+       'type' => 'article',
+@@ -495,8 +495,8 @@ protected function videoTest() {
+       ->execute();
+     $video_media_id = reset($video_media_id);
+ 
+-    // Reference the created media using an entity_reference field and make sure
+-    // the output is what we expect.
++    // Reference the created media using a media field and make sure the output
++    // is what we expect.
+     $node = Node::create([
+       'title' => 'Host node',
+       'type' => 'article',
+diff --git a/core/modules/media/tests/src/Kernel/MediaItemTest.php b/core/modules/media/tests/src/Kernel/MediaItemTest.php
+new file mode 100644
+index 0000000000..c06b097566
+--- /dev/null
++++ b/core/modules/media/tests/src/Kernel/MediaItemTest.php
+@@ -0,0 +1,205 @@
++<?php
++
++namespace Drupal\Tests\media\Kernel;
++
++use Drupal\entity_test\Entity\EntityTest;
++use Drupal\field\Entity\FieldConfig;
++use Drupal\field\Entity\FieldStorageConfig;
++use Drupal\language\Entity\ConfigurableLanguage;
++
++/**
++ * Tests the access of field values with the media item.
++ *
++ * @group media
++ */
++class MediaItemTest extends MediaKernelTestBase {
++
++  /**
++   * {@inheritdoc}
++   */
++  public static $modules = ['entity_test', 'language'];
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function setUp() {
++    parent::setUp();
++
++    $this->installEntitySchema('entity_test');
++
++    $field_name = 'field_media';
++    $entity_type = 'entity_test';
++    FieldStorageConfig::create([
++      'field_name' => $field_name,
++      'type' => 'media',
++      'entity_type' => $entity_type,
++      'cardinality' => -1,
++      'settings' => [
++        'target_type' => 'media',
++      ],
++    ])->save();
++
++    FieldConfig::create([
++      'field_name' => $field_name,
++      'entity_type' => $entity_type,
++      'bundle' => $entity_type,
++      'label' => $field_name,
++    ])->save();
++  }
++
++  /**
++   * Tests the overwrites for a media field.
++   */
++  public function testOverwrittenMetadata() {
++    $mediaType = $this->createMediaType('file');
++    $media = $this->generateMedia('test.patch', $mediaType);
++    $media->save();
++
++    $entity = EntityTest::create([
++      'name' => 'Test entity',
++      'field_media' => $media,
++    ]);
++    $entity->save();
++
++    $this->assertEquals('Mr. Jones', $entity->field_media->entity->getName());
++    $this->assertEquals('', $entity->field_media->entity->field_media_file->entity->description);
++    $this->assertEquals(1, $entity->field_media->entity->field_media_file->entity->id());
++    $this->assertEquals('test.patch', $entity->field_media->entity->field_media_file->entity->getFilename());
++
++    $entity->field_media->overwritten_property_map = [
++      'name' => 'Overwritten name',
++      'field_media_file' => [['description' => 'Nice description!']],
++    ];
++
++    $this->assertEquals('Overwritten name', $entity->field_media->entity->getName());
++    $this->assertEquals('Nice description!', $entity->field_media->entity->field_media_file->description);
++    $this->assertEquals(1, $entity->field_media->entity->field_media_file->entity->id());
++    $this->assertEquals('test.patch', $entity->field_media->entity->field_media_file->entity->getFilename());
++
++    $entity->save();
++
++    $this->assertEquals('Overwritten name', $entity->field_media->entity->getName());
++    $this->assertEquals('Nice description!', $entity->field_media->entity->field_media_file->description);
++    $this->assertEquals(1, $entity->field_media->entity->field_media_file->entity->id());
++    $this->assertEquals('test.patch', $entity->field_media->entity->field_media_file->entity->getFilename());
++  }
++
++  /**
++   * Tests the overwrites for a media field.
++   */
++  public function testMultivalueOverwrittenMetadata() {
++    $mediaType = $this->createMediaType('file');
++
++    FieldStorageConfig::create([
++      'field_name' => 'field_text',
++      'type' => 'string',
++      'entity_type' => 'media',
++      'cardinality' => -1,
++    ])->save();
++
++    FieldConfig::create([
++      'field_name' => 'field_text',
++      'entity_type' => 'media',
++      'bundle' => $mediaType->id(),
++      'label' => 'field_text',
++    ])->save();
++
++    $media1 = $this->generateMedia('test.patch', $mediaType);
++    $media1->field_text = 'Media Text 1';
++    $media1->save();
++
++    $media2 = $this->generateMedia('test1.patch', $mediaType);
++    $media2->save();
++
++    $entity = EntityTest::create([
++      'name' => 'Test entity',
++      'field_media' => [$media1, $media2],
++    ]);
++    $entity->save();
++
++    $this->assertEquals('Mr. Jones', $entity->field_media->entity->getName());
++    $this->assertEquals('', $entity->field_media->entity->field_media_file->entity->description);
++    $this->assertEquals(1, $entity->field_media->entity->field_media_file->entity->id());
++    $this->assertEquals('test.patch', $entity->field_media->entity->field_media_file->entity->getFilename());
++
++    $this->assertEquals('Mr. Jones', $entity->field_media->get(1)->entity->getName());
++    $this->assertEquals('', $entity->field_media->get(1)->entity->field_media_file->entity->description);
++    // ID 3 is correct, ID 2 is the generic media icon.
++    $this->assertEquals(3, $entity->field_media->get(1)->entity->field_media_file->entity->id());
++    $this->assertEquals('test1.patch', $entity->field_media->get(1)->entity->field_media_file->entity->getFilename());
++
++    $entity->field_media->get(0)->overwritten_property_map = [
++      'name' => 'Overwritten name',
++      'field_media_file' => [['description' => 'Nice description!']],
++      'field_text' => [1 => ['value' => 'Overwritten Text 2']],
++    ];
++    $entity->field_media->get(1)->overwritten_property_map = [
++      'name' => 'Overwritten name for media 2',
++      'field_media_file' => [['description' => 'Nice description for media 2!']],
++    ];
++    $entity->save();
++
++    $this->assertEquals('Overwritten name', $entity->field_media->get(0)->entity->getName());
++    $this->assertEquals('Nice description!', $entity->field_media->get(0)->entity->field_media_file->description);
++    $this->assertEquals(1, $entity->field_media->get(0)->entity->field_media_file->entity->id());
++    $this->assertEquals('test.patch', $entity->field_media->get(0)->entity->field_media_file->entity->getFilename());
++    $this->assertEquals('Media Text 1', $entity->field_media->get(0)->entity->field_text->get(0)->value);
++    $this->assertEmpty($entity->field_media->get(0)->entity->field_text->get(1));
++
++    $this->assertEquals('Overwritten name for media 2', $entity->field_media->get(1)->entity->getName());
++    $this->assertEquals('Nice description for media 2!', $entity->field_media->get(1)->entity->field_media_file->get(0)->description);
++    $this->assertEquals(3, $entity->field_media->get(1)->entity->field_media_file->entity->id());
++    $this->assertEquals('test1.patch', $entity->field_media->get(1)->entity->field_media_file->entity->getFilename());
++  }
++
++  /**
++   * Test translated overwritten metadata.
++   *
++   * @throws \Drupal\Core\Entity\EntityStorageException
++   */
++  public function testTranslatableOverwrittenMetdata() {
++    for ($i = 0; $i < 3; ++$i) {
++      $language_id = 'l' . $i;
++      ConfigurableLanguage::create([
++        'id' => $language_id,
++        'label' => $this->randomString(),
++      ])->save();
++      file_put_contents('public://' . $language_id . '.png', '');
++    }
++    $available_langcodes = array_keys($this->container->get('language_manager')->getLanguages());
++
++    $mediaType = $this->createMediaType('file');
++    $media = $this->generateMedia('test.patch', $mediaType);
++    foreach ($available_langcodes as $langcode) {
++      $translation = $media->hasTranslation($langcode) ? $media->getTranslation($langcode) : $media->addTranslation($langcode, $media->toArray());
++      $translation->setName("Name $langcode");
++    }
++    $media->save();
++
++    $entity = EntityTest::create([
++      'name' => 'Test entity',
++      'field_media' => $media,
++      'langcode' => reset($available_langcodes),
++    ]);
++
++    foreach ($available_langcodes as $langcode) {
++      $translation = $entity->hasTranslation($langcode) ? $entity->getTranslation($langcode) : $entity->addTranslation($langcode, $entity->toArray());
++      $translation->field_media->overwritten_property_map = [
++        'field_media_file' => [['description' => "Nice $langcode description!"]],
++      ];
++    }
++    $entity->save();
++
++    foreach ($available_langcodes as $langcode) {
++      $translation = $entity->getTranslation($langcode);
++      $media_translation = $translation->field_media->entity->getTranslation($langcode);
++
++      $this->assertEquals("Name $langcode", $media_translation->getName());
++      $this->assertEquals("Nice $langcode description!", $media_translation->field_media_file->description);
++      $this->assertEquals(1, $media_translation->field_media_file->entity->id());
++      $this->assertEquals('test.patch', $media_translation->field_media_file->entity->getFilename());
++    }
++
++  }
++
++}
+diff --git a/core/modules/media/tests/src/Kernel/OverwrittenMetadataConstraintValidatorTest.php b/core/modules/media/tests/src/Kernel/OverwrittenMetadataConstraintValidatorTest.php
+new file mode 100644
+index 0000000000..dfaaa15080
+--- /dev/null
++++ b/core/modules/media/tests/src/Kernel/OverwrittenMetadataConstraintValidatorTest.php
+@@ -0,0 +1,100 @@
++<?php
++
++namespace Drupal\Tests\media\Kernel;
++
++use Drupal\Core\Entity\Plugin\DataType\EntityAdapter;
++use Drupal\Core\Entity\Plugin\DataType\EntityReference;
++use Drupal\media\Plugin\Field\FieldType\MediaItem;
++use Drupal\media\Plugin\Validation\Constraint\OverwrittenMetadataConstraint;
++use Drupal\media\Plugin\Validation\Constraint\OverwrittenMetadataConstraintValidator;
++use Symfony\Component\Validator\Context\ExecutionContextInterface;
++
++/**
++ * Class OverwrittenMetadataConstraintValidatorTest.
++ *
++ * @group media
++ */
++class OverwrittenMetadataConstraintValidatorTest extends MediaKernelTestBase {
++
++  /**
++   * Tests the OverwrittenMetadataConstraintValidator.
++   *
++   * @dataProvider providerValidate
++   */
++  public function testValidate($overwritten_property_map, $valid) {
++    $context = $this->createMock(ExecutionContextInterface::class);
++
++    if ($valid) {
++      $context->expects($this->never())
++        ->method('addViolation');
++    }
++    else {
++      $context->expects($this->once())
++        ->method('addViolation');
++    }
++
++    $image_type = $this->createMediaType('file');
++
++    $media = $this->generateMedia('foo.patch', $image_type);
++
++    $entity_adapter = $this->createMock(EntityAdapter::class);
++    $entity_adapter->expects($this->once())
++      ->method('getValue')
++      ->willReturn($media);
++
++    $entity = $this->createMock(EntityReference::class);
++    $entity->expects($this->once())
++      ->method('getTarget')
++      ->willReturn($entity_adapter);
++
++    $value = $this->createMock(MediaItem::class);
++    $value->expects($this->once())
++      ->method('get')
++      ->with('entity')
++      ->willReturn($entity);
++    $value->expects($this->atLeast(1))
++      ->method('__get')
++      ->with('overwritten_property_map')
++      ->willReturn($overwritten_property_map);
++
++    $constraint = new OverwrittenMetadataConstraint();
++    $validate = new OverwrittenMetadataConstraintValidator(\Drupal::service('typed_data_manager'));
++    $validate->initialize($context);
++    $validate->validate($value, $constraint);
++  }
++
++  /**
++   * Data provider for OverwrittenMetadataConstraintValidator::validate().
++   *
++   * @return array
++   *   An array of tests, matching the parameter inputs for testValidate.
++   */
++  public function providerValidate() {
++    return [
++      [
++        ['name' => 'Nice name!'],
++        TRUE,
++      ],
++      [
++        ['name' => 'Nice name!', 'field_media_file' => ['description' => 'Nice description.']],
++        TRUE,
++      ],
++      [
++        [
++          'name' => 'Nice name!',
++          'field_media_file' => ['description' => 'Nice description.', 'display' => 'Not allowed'],
++        ],
++        FALSE,
++      ],
++      [
++        ['field_not_allowed' => []],
++        FALSE,
++      ],
++      [
++        ['name' => 'This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text. This is a very long text.'],
++        FALSE,
++      ],
++    ];
++  }
++
++}
+diff --git a/core/modules/media/tests/src/Kernel/ReadOnlyMediaTest.php b/core/modules/media/tests/src/Kernel/ReadOnlyMediaTest.php
+new file mode 100644
+index 0000000000..a6fc066db7
+--- /dev/null
++++ b/core/modules/media/tests/src/Kernel/ReadOnlyMediaTest.php
+@@ -0,0 +1,116 @@
++<?php
++
++namespace Drupal\Tests\media\Kernel;
++
++use Drupal\field\Entity\FieldConfig;
++use Drupal\field\Entity\FieldStorageConfig;
++use Drupal\media\ReadOnlyMedia;
++
++/**
++ * Tests the access of field values with the media item.
++ *
++ * @group media
++ * @coversDefaultClass \Drupal\media\ReadOnlyMedia
++ */
++class ReadOnlyMediaTest extends MediaKernelTestBase {
++
++  /**
++   * {@inheritdoc}
++   */
++  public static $modules = ['entity_test', 'language'];
++
++  /**
++   * The original media entity.
++   *
++   * @var \Drupal\media\Entity\Media
++   */
++  protected $media;
++
++  /**
++   * {@inheritdoc}
++   */
++  protected function setUp() {
++    parent::setUp();
++
++    $mediaType = $this->createMediaType('file');
++
++    FieldStorageConfig::create([
++      'field_name' => 'field_text',
++      'type' => 'string',
++      'entity_type' => 'media',
++      'cardinality' => -1,
++    ])->save();
++
++    FieldConfig::create([
++      'field_name' => 'field_text',
++      'entity_type' => 'media',
++      'bundle' => $mediaType->id(),
++      'label' => 'field_text',
++    ])->save();
++
++    $this->media = $this->generateMedia('text.patch', $mediaType);
++    $this->media->field_text = ['Media Text 1', 'Media Text 2'];
++    $this->media->save();
++  }
++
++  /**
++   * Data provider for testGet().
++   */
++  public function providerGet() {
++    return [
++      // Basic overwrite.
++      [
++        ['name' => 'Dr. Doolittle'],
++        [
++          'name' => [['value' => 'Dr. Doolittle']],
++          'field_media_file' => [['target_id' => 1]],
++        ],
++      ],
++      [
++        [
++          'name' => 'Dr. Doolittle',
++          'field_media_file' => [['description' => 'Nice description']],
++        ],
++        [
++          'name' => [['value' => 'Dr. Doolittle']],
++          'field_media_file' => [['target_id' => 1, 'description' => 'Nice description']],
++        ],
++      ],
++      // Overwriting a multi value field.
++      [
++        [
++          'name' => 'Dr. Doolittle',
++          'field_text' => [
++            1 => ['value' => 'Overwritten Text 2'],
++            2 => ['value' => 'This value does not exists on the original media entity.'],
++          ],
++        ],
++        [
++          'name' => [['value' => 'Dr. Doolittle']],
++          'field_text' => [
++            ['value' => 'Media Text 1'],
++            ['value' => 'Overwritten Text 2'],
++          ],
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * @covers ::get
++   * @covers ::getTypedData
++   * @covers ::toArray
++   * @dataProvider providerGet
++   */
++  public function testGet($overwritten_metadata, $expected_fields) {
++    $readOnlyMediaEntity = new ReadOnlyMedia($this->media, $overwritten_metadata);
++
++    $array = $readOnlyMediaEntity->toArray();
++    foreach ($expected_fields as $field => $value) {
++      $this->assertEquals($value, $readOnlyMediaEntity->get($field)->getValue());
++      $this->assertEquals($value, $readOnlyMediaEntity->getTypedData()->get($field)->getValue());
++      $this->assertEquals($value, $array[$field]);
++    }
++  }
++
++}
+diff --git a/core/modules/media_library/media_library.module b/core/modules/media_library/media_library.module
+index 19ef3c2131..e0952cdf11 100644
+--- a/core/modules/media_library/media_library.module
++++ b/core/modules/media_library/media_library.module
+@@ -10,7 +10,6 @@
+ use Drupal\Core\Entity\EntityInterface;
+ use Drupal\Core\Entity\Entity\EntityFormDisplay;
+ use Drupal\Core\Entity\Entity\EntityViewDisplay;
+-use Drupal\Core\Field\Plugin\Field\FieldType\EntityReferenceItem;
+ use Drupal\Core\Form\FormStateInterface;
+ use Drupal\Core\Render\Element;
+ use Drupal\Core\Routing\RouteMatchInterface;
+@@ -330,19 +329,11 @@ function _media_library_media_type_form_submit(array &$form, FormStateInterface
+ }
+ 
+ /**
+- * Implements hook_field_ui_preconfigured_options_alter().
++ * Implements hook_field_info_alter().
+  */
+-function media_library_field_ui_preconfigured_options_alter(array &$options, $field_type) {
+-  // If the field is not an "entity_reference"-based field, bail out.
+-  $class = \Drupal::service('plugin.manager.field.field_type')->getPluginClass($field_type);
+-  if (!is_a($class, EntityReferenceItem::class, TRUE)) {
+-    return;
+-  }
+-
++function media_library_field_info_alter(&$info) {
+   // Set the default field widget for media to be the Media library.
+-  if (!empty($options['media'])) {
+-    $options['media']['entity_form_display']['type'] = 'media_library_widget';
+-  }
++  $info['media']['default_widget'] = 'media_library_widget';
+ }
+ 
+ /**
+diff --git a/core/modules/media_library/src/MediaLibraryFieldWidgetOpener.php b/core/modules/media_library/src/MediaLibraryFieldWidgetOpener.php
+index 84099ed3f6..4cfb3fe541 100644
+--- a/core/modules/media_library/src/MediaLibraryFieldWidgetOpener.php
++++ b/core/modules/media_library/src/MediaLibraryFieldWidgetOpener.php
+@@ -95,11 +95,8 @@ public function checkAccess(MediaLibraryState $state, AccountInterface $account)
+     $items = $entity->get($field_name);
+     $field_definition = $items->getFieldDefinition();
+ 
+-    if ($field_definition->getType() !== 'entity_reference') {
+-      throw new \LogicException('Expected the media library to be opened by an entity reference field.');
+-    }
+-    if ($field_definition->getFieldStorageDefinition()->getSetting('target_type') !== 'media') {
+-      throw new \LogicException('Expected the media library to be opened by an entity reference field that target media items.');
++    if ($field_definition->getType() !== 'media') {
++      throw new \LogicException('Expected the media library to be opened by a media field.');
+     }
+ 
+     $field_access = $access_handler->fieldAccess('edit', $field_definition, $account, $items, TRUE);
+diff --git a/core/modules/media_library/src/Plugin/Field/FieldWidget/MediaLibraryWidget.php b/core/modules/media_library/src/Plugin/Field/FieldWidget/MediaLibraryWidget.php
+index ac9cb3b510..497c25bfea 100644
+--- a/core/modules/media_library/src/Plugin/Field/FieldWidget/MediaLibraryWidget.php
++++ b/core/modules/media_library/src/Plugin/Field/FieldWidget/MediaLibraryWidget.php
+@@ -35,7 +35,7 @@
+  *   label = @Translation("Media library"),
+  *   description = @Translation("Allows you to select items from the media library."),
+  *   field_types = {
+- *     "entity_reference"
++ *     "media"
+  *   },
+  *   multiple_values = TRUE,
+  * )
+@@ -117,13 +117,6 @@ public static function create(ContainerInterface $container, array $configuratio
+     );
+   }
+ 
+-  /**
+-   * {@inheritdoc}
+-   */
+-  public static function isApplicable(FieldDefinitionInterface $field_definition) {
+-    return $field_definition->getSetting('target_type') === 'media';
+-  }
+-
+   /**
+    * {@inheritdoc}
+    */
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_empty_types_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_empty_types_media.yml
+index 0fc4cb8c1b..a9cfd289d4 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_empty_types_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_empty_types_media.yml
+@@ -22,4 +22,4 @@ settings:
+       field: _none
+     auto_create: false
+     auto_create_bundle: file
+-field_type: entity_reference
++field_type: media
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_noadd_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_noadd_media.yml
+index 327e0fb584..9f1821bd8c 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_noadd_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_noadd_media.yml
+@@ -26,4 +26,4 @@ settings:
+       field: _none
+     auto_create: false
+     auto_create_bundle: file
+-field_type: entity_reference
++field_type: media
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_null_types_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_null_types_media.yml
+index 91a2f1ceb0..e444ca57b2 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_null_types_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_null_types_media.yml
+@@ -22,4 +22,4 @@ settings:
+       field: _none
+     auto_create: false
+     auto_create_bundle: file
+-field_type: entity_reference
++field_type: media
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_single_media_type.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_single_media_type.yml
+index 4565087a38..0a39666525 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_single_media_type.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_single_media_type.yml
+@@ -25,4 +25,4 @@ settings:
+       field: _none
+     auto_create: false
+     auto_create_bundle: file
+-field_type: entity_reference
++field_type: media
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_twin_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_twin_media.yml
+index 5c874b736f..ebb8b3577a 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_twin_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_twin_media.yml
+@@ -28,4 +28,4 @@ settings:
+       field: _none
+     auto_create: false
+     auto_create_bundle: file
+-field_type: entity_reference
++field_type: media
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_unlimited_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_unlimited_media.yml
+index e0f4f7ff4a..b8c8e1b62c 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_unlimited_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.field.node.basic_page.field_unlimited_media.yml
+@@ -26,4 +26,4 @@ settings:
+       field: _none
+     auto_create: false
+     auto_create_bundle: audio
+-field_type: entity_reference
++field_type: media
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_empty_types_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_empty_types_media.yml
+index 1b9af61157..24b8f7f4df 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_empty_types_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_empty_types_media.yml
+@@ -7,7 +7,7 @@ dependencies:
+ id: node.field_empty_types_media
+ field_name: field_empty_types_media
+ entity_type: node
+-type: entity_reference
++type: media
+ settings:
+   target_type: media
+ module: core
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_noadd_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_noadd_media.yml
+index 80bb78a4dc..c642965c12 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_noadd_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_noadd_media.yml
+@@ -7,7 +7,7 @@ dependencies:
+ id: node.field_noadd_media
+ field_name: field_noadd_media
+ entity_type: node
+-type: entity_reference
++type: media
+ settings:
+   target_type: media
+ module: core
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_null_types_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_null_types_media.yml
+index 7fd55588f0..4cccb664cb 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_null_types_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_null_types_media.yml
+@@ -7,7 +7,7 @@ dependencies:
+ id: node.field_null_types_media
+ field_name: field_null_types_media
+ entity_type: node
+-type: entity_reference
++type: media
+ settings:
+   target_type: media
+ module: core
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_single_media_type.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_single_media_type.yml
+index cd1485a897..75f5bffa8a 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_single_media_type.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_single_media_type.yml
+@@ -7,7 +7,7 @@ dependencies:
+ id: node.field_single_media_type
+ field_name: field_single_media_type
+ entity_type: node
+-type: entity_reference
++type: media
+ settings:
+   target_type: media
+ module: core
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_twin_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_twin_media.yml
+index c7b38e6a65..cd41de1a6f 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_twin_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_twin_media.yml
+@@ -7,7 +7,7 @@ dependencies:
+ id: node.field_twin_media
+ field_name: field_twin_media
+ entity_type: node
+-type: entity_reference
++type: media
+ settings:
+   target_type: media
+ module: core
+diff --git a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_unlimited_media.yml b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_unlimited_media.yml
+index a2391d2a10..a842d5dcee 100644
+--- a/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_unlimited_media.yml
++++ b/core/modules/media_library/tests/modules/media_library_test/config/install/field.storage.node.field_unlimited_media.yml
+@@ -7,7 +7,7 @@ dependencies:
+ id: node.field_unlimited_media
+ field_name: field_unlimited_media
+ entity_type: node
+-type: entity_reference
++type: media
+ settings:
+   target_type: media
+ module: core
+diff --git a/core/modules/media_library/tests/src/FunctionalJavascript/ContentModerationTest.php b/core/modules/media_library/tests/src/FunctionalJavascript/ContentModerationTest.php
+index f785235184..eccd18391a 100644
+--- a/core/modules/media_library/tests/src/FunctionalJavascript/ContentModerationTest.php
++++ b/core/modules/media_library/tests/src/FunctionalJavascript/ContentModerationTest.php
+@@ -3,11 +3,12 @@
+ namespace Drupal\Tests\media_library\FunctionalJavascript;
+ 
+ use Drupal\Core\Field\FieldStorageDefinitionInterface;
++use Drupal\field\Entity\FieldConfig;
++use Drupal\field\Entity\FieldStorageConfig;
+ use Drupal\file\Entity\File;
+ use Drupal\FunctionalJavascriptTests\WebDriverTestBase;
+ use Drupal\media\Entity\Media;
+ use Drupal\Tests\content_moderation\Traits\ContentModerationTestTrait;
+-use Drupal\Tests\field\Traits\EntityReferenceTestTrait;
+ use Drupal\Tests\media\Traits\MediaTypeCreationTrait;
+ use Drupal\Tests\TestFileCreationTrait;
+ 
+@@ -19,7 +20,6 @@
+ class ContentModerationTest extends WebDriverTestBase {
+ 
+   use ContentModerationTestTrait;
+-  use EntityReferenceTestTrait;
+   use MediaTypeCreationTrait;
+   use TestFileCreationTrait;
+ 
+@@ -79,16 +79,28 @@ protected function setUp() {
+     $this->drupalCreateContentType(['type' => 'article', 'name' => 'Article']);
+ 
+     // Create a media reference field on articles.
+-    $this->createEntityReferenceField(
+-      'node',
+-      'article',
+-      'field_media',
+-      'Media',
+-      'media',
+-      'default',
+-      ['target_bundles' => ['image']],
+-      FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED
+-    );
++    FieldStorageConfig::create([
++      'field_name' => 'field_media',
++      'entity_type' => 'node',
++      'type' => 'media',
++      'settings' => [
++        'target_type' => 'media',
++      ],
++      'cardinality' => FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED,
++
++    ])->save();
++
++    FieldConfig::create([
++      'field_name' => 'field_media',
++      'entity_type' => 'node',
++      'bundle' => 'article',
++      'label' => 'Media',
++      'settings' => [
++        'handler' => 'default',
++        'handler_settings' => ['target_bundles' => ['image']],
++      ],
++    ])->save();
++
+     // Add the media field to the form display.
+     $form_display = \Drupal::service('entity_display.repository')->getFormDisplay('node', 'article', 'default');
+     $form_display->setComponent('field_media', [
+diff --git a/core/modules/media_library/tests/src/FunctionalJavascript/EmbeddedFormWidgetTest.php b/core/modules/media_library/tests/src/FunctionalJavascript/EmbeddedFormWidgetTest.php
+index eac555c419..8310879286 100644
+--- a/core/modules/media_library/tests/src/FunctionalJavascript/EmbeddedFormWidgetTest.php
++++ b/core/modules/media_library/tests/src/FunctionalJavascript/EmbeddedFormWidgetTest.php
+@@ -41,7 +41,7 @@ protected function setUp() {
+     FieldStorageConfig::create([
+       'field_name' => 'media_image_field',
+       'entity_type' => 'node',
+-      'type' => 'entity_reference',
++      'type' => 'media',
+       'settings' => [
+         'target_type' => 'media',
+         'required' => TRUE,
+@@ -53,7 +53,7 @@ protected function setUp() {
+       'field_name' => 'media_image_field',
+       'entity_type' => 'node',
+       'bundle' => 'basic_page',
+-      'field_type' => 'entity_reference',
++      'field_type' => 'media',
+       'required' => TRUE,
+       'settings' => [
+         'handler_settings' => [
+diff --git a/core/modules/media_library/tests/src/FunctionalJavascript/FieldUiIntegrationTest.php b/core/modules/media_library/tests/src/FunctionalJavascript/FieldUiIntegrationTest.php
+index 9baa5b79a4..f05b2674a1 100644
+--- a/core/modules/media_library/tests/src/FunctionalJavascript/FieldUiIntegrationTest.php
++++ b/core/modules/media_library/tests/src/FunctionalJavascript/FieldUiIntegrationTest.php
+@@ -44,7 +44,7 @@ public function testFieldUiIntegration() {
+     $this->drupalLogin($user);
+ 
+     $this->drupalGet('/admin/structure/types/manage/article/fields/add-field');
+-    $page->selectFieldOption('new_storage_type', 'field_ui:entity_reference:media');
++    $page->selectFieldOption('new_storage_type', 'media');
+     $this->assertNotNull($assert_session->waitForField('label'));
+     $page->fillField('label', 'Shatner');
+     $this->waitForText('field_shatner');
+diff --git a/core/modules/media_library/tests/src/FunctionalJavascript/TranslationsTest.php b/core/modules/media_library/tests/src/FunctionalJavascript/TranslationsTest.php
+index 0a659b5d8d..a165bdfc6b 100644
+--- a/core/modules/media_library/tests/src/FunctionalJavascript/TranslationsTest.php
++++ b/core/modules/media_library/tests/src/FunctionalJavascript/TranslationsTest.php
+@@ -3,6 +3,8 @@
+ namespace Drupal\Tests\media_library\FunctionalJavascript;
+ 
+ use Drupal\Core\Field\FieldStorageDefinitionInterface;
++use Drupal\field\Entity\FieldConfig;
++use Drupal\field\Entity\FieldStorageConfig;
+ use Drupal\file\Entity\File;
+ use Drupal\FunctionalJavascriptTests\WebDriverTestBase;
+ use Drupal\language\Entity\ConfigurableLanguage;
+@@ -58,16 +60,25 @@ protected function setUp() {
+     \Drupal::service('content_translation.manager')->setEnabled('media', 'image', TRUE);
+ 
+     // Create a media reference field on articles.
+-    $this->createEntityReferenceField(
+-      'node',
+-      'article',
+-      'field_media',
+-      'Media',
+-      'media',
+-      'default',
+-      ['target_bundles' => ['image']],
+-      FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED
+-    );
++    FieldStorageConfig::create([
++      'field_name' => 'field_media',
++      'type' => 'media',
++      'entity_type' => 'node',
++      'cardinality' => FieldStorageDefinitionInterface::CARDINALITY_UNLIMITED,
++      'settings' => [
++        'target_type' => 'media',
++      ],
++    ])->save();
++    FieldConfig::create([
++      'field_name' => 'field_media',
++      'entity_type' => 'node',
++      'bundle' => 'article',
++      'label' => 'Media',
++      'settings' => [
++        'handler' => 'default',
++        'handler_settings' => ['target_bundles' => ['image']],
++      ],
++    ])->save();
+     // Add the media field to the form display.
+     \Drupal::service('entity_display.repository')->getFormDisplay('node', 'article')
+       ->setComponent('field_media', ['type' => 'media_library_widget'])
+diff --git a/core/modules/media_library/tests/src/Kernel/MediaLibraryAccessTest.php b/core/modules/media_library/tests/src/Kernel/MediaLibraryAccessTest.php
+index 389561d4e2..bdc049f57d 100644
+--- a/core/modules/media_library/tests/src/Kernel/MediaLibraryAccessTest.php
++++ b/core/modules/media_library/tests/src/Kernel/MediaLibraryAccessTest.php
+@@ -65,7 +65,7 @@ protected function setUp() {
+     EntityTestBundle::create(['id' => 'test'])->save();
+ 
+     $field_storage = FieldStorageConfig::create([
+-      'type' => 'entity_reference',
++      'type' => 'media',
+       'field_name' => 'field_test_media',
+       'entity_type' => 'entity_test',
+       'settings' => [
+@@ -259,7 +259,7 @@ public function testFieldWidgetEntityEditAccess() {
+    */
+   public function testFieldWidgetEntityFieldAccess() {
+     $field_storage = FieldStorageConfig::create([
+-      'type' => 'entity_reference',
++      'type' => 'media',
+       'entity_type' => 'entity_test',
+       // The media_library_test module will deny access to this field.
+       // @see media_library_test_entity_field_access()
